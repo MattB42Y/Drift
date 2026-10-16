@@ -169,7 +169,7 @@ const RTC={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l
 const uid='u'+Math.random().toString(36).slice(2,10);
 const rid=roomId||Math.random().toString(36).slice(2,8);
 if(!roomId)history.replaceState(null,'','?room='+rid);
-let rooms=[],claimed=false,gotState=false,claimT=null,claimSoon=false,seq=0;
+let rx=0,txErr=0,lastErr='',rooms=[],claimed=false,gotState=false,claimT=null,claimSoon=false,seq=0;
 const seen=new Set(),links={},keyUid={};
 const leader=()=>Object.keys(players).sort()[0];
 function freeSeat(){const used=Object.entries(players).filter(([k])=>k!==me.id).map(([,p])=>p.seat);let s=0;while(used.includes(s))s++;return s;}
@@ -180,6 +180,7 @@ function claim(){if(claimed)return;me.seat=freeSeat();claimed=true;players[me.id
 function bcast(d){d.u=uid;d.n=++seq;rooms.forEach(r=>{try{r.send(d);}catch(e){}});}
 function act(d){onMsg(d,uid);bcast(d);}
 function recvRaw(d,pid,r){
+  rx++;
   if(!d||!d.u||d.u===uid)return;
   const key=r.name+pid;keyUid[key]=d.u;(links[d.u]=links[d.u]||new Set()).add(key);
   const k=d.u+':'+d.n;if(seen.has(k))return;seen.add(k);if(seen.size>4000)seen.clear();
@@ -211,7 +212,7 @@ async function addRoom(name,url){
     const T=await import(url);
     const room=T.joinRoom({appId:'drift-wiki-starship-v1',rtcConfig:RTC},rid);
     const ac=room.makeAction('m');
-    const r={name,count:0,send:(d,pid)=>{try{const p=ac.send(d,pid?{target:pid}:undefined);if(p&&p.catch)p.catch(()=>{});}catch(e){}}};
+    const r={name,count:0,send:(d,pid)=>{try{const p=ac.send(d,pid?{target:pid}:undefined);if(p&&p.catch)p.catch(e=>{txErr++;lastErr=String(e&&e.message||e).slice(0,40);});}catch(e){txErr++;lastErr=String(e&&e.message||e).slice(0,40);}}};
     rooms.push(r);
     ac.onMessage=(d,ctx)=>recvRaw(d,ctx.peerId,r);
     room.onPeerJoin=pid=>{r.count++;r.send({t:'hello',...myInfo(),u:uid,n:++seq},pid);};
@@ -224,7 +225,8 @@ async function net(){
   setInterval(()=>{const sec=(Date.now()-t0)/1000|0;
     const st=STRATS.map(([n])=>{const r=rooms.find(x=>x.name===n);return n+':'+(r?r.count:'off');}).join(' ');
     const linked=Object.keys(links).length;
-    $('#crew').textContent='Room '+rid+' · crew '+Object.keys(players).length+' · linked '+linked+' ['+st+']'+(linked===0&&sec>10?' · searching '+sec+'s…':'');},1000);
+    $('#crew').textContent='Room '+rid+' · crew '+Object.keys(players).length+' · linked '+linked+' ['+st+']'+' · rx:'+rx+' txerr:'+txErr+(lastErr?' ('+lastErr+')':'')+(linked===0&&sec>10?' · searching '+sec+'s…':'');},1000);
+  setInterval(()=>{if(rooms.length)bcast({t:'hello',...myInfo()});},2000);
   setInterval(()=>{if(claimed&&leader()===me.id)bcast({t:'sync',y:scrollY,speed:state.speed,title:state.title});},1000);
   await Promise.all(STRATS.map(([n,u])=>addRoom(n,u)));
   if(!rooms.length)$('#now').textContent='Solo mode (multiplayer libraries failed to load)';
