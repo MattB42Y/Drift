@@ -160,17 +160,35 @@ async function resolve(q){
   try{const j=await(await fetch('https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&list=search&srlimit=1&srsearch='+encodeURIComponent(q))).json();
     return j.query.search[0]?j.query.search[0].title:q;}catch(e){return q;}}
 
-/* ---------- networking (serverless, Trystero) ---------- */
-let room=null,sendM=null,claimed=false,gotState=false,claimT=null,claimSoon=false;
+/* ---------- networking (serverless; Trystero over 3 relay types at once) ---------- */
+const STRATS=[['torrent','https://esm.run/@trystero-p2p/torrent'],['mqtt','https://esm.run/@trystero-p2p/mqtt'],['nostr','https://esm.run/trystero']];
+const RTC={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},
+  {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turns:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}]};
+const uid='u'+Math.random().toString(36).slice(2,10);
 const rid=roomId||Math.random().toString(36).slice(2,8);
 if(!roomId)history.replaceState(null,'','?room='+rid);
+let rooms=[],claimed=false,gotState=false,claimT=null,claimSoon=false,seq=0;
+const seen=new Set(),links={},keyUid={};
 const leader=()=>Object.keys(players).sort()[0];
 function freeSeat(){const used=Object.entries(players).filter(([k])=>k!==me.id).map(([,p])=>p.seat);let s=0;while(used.includes(s))s++;return s;}
 function setPlayer(id,p){const old=players[id];players[id]=p;
   if(id!==me.id&&(!avatars[id]||!old||old.seat!==p.seat)){rmAvatar(id);mkAvatar(id,p);}crew();}
 function myInfo(){return{name:me.name,seat:claimed?me.seat:-1,state:{title:state.title,speed:state.speed,y:scrollY}};}
-function claim(){me.seat=freeSeat();claimed=true;players[me.id]={name:me.name,seat:me.seat};seatMe();crew();lastPose='';}
-function act(d){onMsg(d,me.id);if(sendM)sendM(d);}
+function claim(){if(claimed)return;me.seat=freeSeat();claimed=true;players[me.id]={name:me.name,seat:me.seat};seatMe();crew();lastPose='';}
+function bcast(d){d.u=uid;d.n=++seq;rooms.forEach(r=>{try{r.send(d);}catch(e){}});}
+function act(d){onMsg(d,uid);bcast(d);}
+function recvRaw(d,pid,r){
+  if(!d||!d.u||d.u===uid)return;
+  const key=r.name+pid;keyUid[key]=d.u;(links[d.u]=links[d.u]||new Set()).add(key);
+  const k=d.u+':'+d.n;if(seen.has(k))return;seen.add(k);if(seen.size>4000)seen.clear();
+  onMsg(d,d.u);
+}
+function peerGone(r,pid){
+  const key=r.name+pid,u=keyUid[key];delete keyUid[key];
+  if(u&&links[u]){links[u].delete(key);if(!links[u].size){delete links[u];delete players[u];rmAvatar(u);crew();}}
+}
 function onMsg(d,from){
   switch(d.t){
     case 'nav':load(d.title);break;
@@ -180,34 +198,40 @@ function onMsg(d,from){
     case 'hello':{
       if(!gotState&&!claimed&&d.state){gotState=true;state.speed=d.state.speed;$('#spd').value=d.state.speed;
         if(d.state.title!==state.title)load(d.state.title);scrollY=d.state.y;}
-      if(!claimed&&!claimSoon){claimSoon=true;clearTimeout(claimT);claimT=setTimeout(()=>{if(!claimed){claim();sendM&&sendM({t:'hello',...myInfo()});}},700);}
+      if(!claimed&&!claimSoon){claimSoon=true;clearTimeout(claimT);claimT=setTimeout(()=>{claim();bcast({t:'hello',...myInfo()});},700);}
       if(d.seat>=0){
-        if(claimed&&d.seat===me.seat&&from<me.id){claim();sendM&&sendM({t:'hello',...myInfo()});}
+        if(claimed&&d.seat===me.seat&&from<me.id){claimed=false;claim();bcast({t:'hello',...myInfo()});}
         setPlayer(from,{name:d.name,seat:d.seat});}
       break;}
     case 'pose':{const a=avatars[from];if(a)a.userData.head.rotation.set(d.pitch,d.yaw-a.userData.base,0);break;}
   }
 }
+async function addRoom(name,url){
+  try{
+    const T=await import(url);
+    const room=T.joinRoom({appId:'drift-wiki-starship-v1',rtcConfig:RTC},rid);
+    const [send,recv]=room.makeAction('m');
+    const r={name,send,count:0};rooms.push(r);
+    recv((d,pid)=>recvRaw(d,pid,r));
+    room.onPeerJoin(pid=>{r.count++;try{send({t:'hello',...myInfo(),u:uid,n:++seq},pid);}catch(e){}});
+    room.onPeerLeave(pid=>{r.count=Math.max(0,r.count-1);peerGone(r,pid);});
+  }catch(e){console.warn('relay failed',name,e);}
+}
 async function net(){
-  me.id='solo';
-  let T=null;
-  for(const u of ['https://esm.run/@trystero-p2p/torrent','https://esm.run/trystero']){try{T=await import(u);break;}catch(e){}}
-  if(!T){$('#now').textContent='Solo mode (multiplayer library failed to load)';claim();return;}
-  me.id=T.selfId;
-  try{room=T.joinRoom({appId:'drift-wiki-starship-v1',rtcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},{urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},{urls:'turns:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}]}},rid);}catch(e){$('#now').textContent='Solo mode ('+e.message+')';claim();return;}
-  const [send,recv]=room.makeAction('m');sendM=send;recv(onMsg);
-  const linked=new Set(),t0=Date.now();
-  room.onPeerJoin(id=>{linked.add(id);send({t:'hello',...myInfo()},id);});
-  room.onPeerLeave(id=>{linked.delete(id);delete players[id];rmAvatar(id);crew();});
-  claimT=setTimeout(()=>{if(!claimed){claim();send({t:'hello',...myInfo()});}},6000);
+  me.id=uid;const t0=Date.now();
+  claimT=setTimeout(()=>{claim();bcast({t:'hello',...myInfo()});},6000);
   setInterval(()=>{const sec=(Date.now()-t0)/1000|0;
-    $('#crew').textContent='Room '+rid+' · crew '+Object.keys(players).length+' · linked '+linked.size+(linked.size===0&&sec>8?' · searching '+sec+'s…':'');},1000);
-  setInterval(()=>{if(claimed&&leader()===me.id)send({t:'sync',y:scrollY,speed:state.speed,title:state.title});},1000);
+    const st=STRATS.map(([n])=>{const r=rooms.find(x=>x.name===n);return n+':'+(r?r.count:'off');}).join(' ');
+    const linked=Object.keys(links).length;
+    $('#crew').textContent='Room '+rid+' · crew '+Object.keys(players).length+' · linked '+linked+' ['+st+']'+(linked===0&&sec>10?' · searching '+sec+'s…':'');},1000);
+  setInterval(()=>{if(claimed&&leader()===me.id)bcast({t:'sync',y:scrollY,speed:state.speed,title:state.title});},1000);
+  await Promise.all(STRATS.map(([n,u])=>addRoom(n,u)));
+  if(!rooms.length)$('#now').textContent='Solo mode (multiplayer libraries failed to load)';
 }
 function sendPose(){
-  if(me.base===undefined||!sendM||!claimed)return;
+  if(me.base===undefined||!claimed||!rooms.length)return;
   const yaw=me.base+yawOff,k=yaw.toFixed(2)+pitch.toFixed(2);if(k===lastPose)return;lastPose=k;
-  sendM({t:'pose',yaw,pitch});
+  bcast({t:'pose',yaw,pitch});
 }
 setInterval(sendPose,100);
 
