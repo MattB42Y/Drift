@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Drift — Wikipedia Starship</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#05070d;color:#d8e6ff;font-family:system-ui,sans-serif;overflow:hidden}
+canvas#c{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+#deck{position:fixed;left:50%;bottom:10px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center;padding:10px 14px;background:rgba(10,18,34,.88);border:1px solid #2a4a7a;border-radius:12px;max-width:96vw;box-shadow:0 0 24px #0a3a6a66}
+#deck input[type=text]{background:#0b1426;border:1px solid #2a4a7a;color:#d8e6ff;padding:7px 10px;border-radius:8px;width:190px}
+button{background:#12305a;color:#d8e6ff;border:1px solid #3a70b8;border-radius:8px;padding:7px 12px;cursor:pointer}
+button:hover{background:#1a4a8a}
+#now{font-weight:600;color:#5ee1ff;max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#chips{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;width:100%}
+#chips button{font-size:12px;padding:3px 8px;background:#0b1426}
+#crew{font-size:12px;opacity:.8}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;background:rgba(3,5,10,.92);z-index:5;text-align:center;padding:20px}
+#start h1{margin:0;font-size:2rem;letter-spacing:.08em}
+#start input{padding:10px 14px;border-radius:8px;border:1px solid #3a70b8;background:#0b1426;color:#d8e6ff;font-size:1rem}
+#hint{position:fixed;top:8px;left:50%;transform:translateX(-50%);font-size:12px;opacity:.6;pointer-events:none}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="hint">Drag to look around · everyone shares the same screen and controls</div>
+<div id="deck" hidden>
+  <span id="now"></span>
+  <input type="text" id="q" placeholder="Where to? e.g. Black holes">
+  <button id="go">Go</button>
+  <label>Speed <input type="range" id="spd" min="0" max="8" step=".5" value="1"></label>
+  <button id="rnd">Random link</button>
+  <button id="inv">Copy invite link</button>
+  <span id="crew"></span>
+  <div id="chips"></div>
+</div>
+<div id="start">
+  <h1>DRIFT</h1>
+  <div id="sub">Float through Wikipedia with your crew.</div>
+  <input id="name" maxlength="14" placeholder="Your name">
+  <button id="boot">Launch ship</button>
+  <div id="err" style="color:#ff8a8a"></div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const $=s=>document.querySelector(s);
+const roomId=new URLSearchParams(location.search).get('room');
+const isHost=!roomId;
+const COLORS=[0x5ee1ff,0xff7ac8,0xffd166,0x9bff7a,0xb08cff,0xff8a5e];
+let peer,hostConn=null,conns=[];
+let me={id:null,name:'',seat:0},players={},state={title:'Solar System',speed:1};
+let scrollY=0,page=null,pageH=1,token=0,advancing=false;
+let yawOff=0,pitch=0,lastPose='';
+const avatars={};
+
+$('#name').value='Pilot'+Math.floor(Math.random()*90+10);
+if(!isHost){$('#boot').textContent='Board the ship';$('#sub').textContent='You\'ve been invited to a starship.';}
+$('#boot').onclick=()=>{me.name=($('#name').value||'Pilot').trim();$('#start').hidden=true;$('#start').style.display='none';$('#deck').hidden=false;init();net();};
+
+/* ---------- three.js scene ---------- */
+let renderer,scene,camera,screenCtx,screenTex,tall,tctx,stars;
+const W=1280,H=720;
+function seatPos(i){const a=(i-2.5)*0.27,R=4.5,x=R*Math.sin(a),z=-3.5+R*Math.cos(a);
+  const yaw=Math.atan2(x,8+z);return{x,z,yaw};}
+function init(){
+  renderer=new THREE.WebGLRenderer({canvas:$('#c'),antialias:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  scene=new THREE.Scene();scene.background=new THREE.Color(0x02030a);
+  camera=new THREE.PerspectiveCamera(70,1,.05,200);camera.rotation.order='YXZ';
+  scene.add(new THREE.AmbientLight(0x6680aa,.8));
+  const pl=new THREE.PointLight(0x66ccff,1.2,30);pl.position.set(0,3,-6);scene.add(pl);
+  const pl2=new THREE.PointLight(0xffffff,.5,20);pl2.position.set(0,3.5,1);scene.add(pl2);
+  // floor
+  const fl=new THREE.Mesh(new THREE.PlaneGeometry(14,18),new THREE.MeshStandardMaterial({color:0x101a2c,metalness:.6,roughness:.5}));
+  fl.rotation.x=-Math.PI/2;fl.position.z=-3;scene.add(fl);
+  const grid=new THREE.GridHelper(14,14,0x2a6ab8,0x16304f);grid.position.set(0,.01,-3);scene.add(grid);
+  // hull ribs
+  for(const z of [-8,-4,0,4]){
+    const rib=new THREE.Mesh(new THREE.TorusGeometry(6.5,.12,8,40,Math.PI),new THREE.MeshStandardMaterial({color:0x1a2a44,emissive:0x0a4a8a,metalness:.7,roughness:.4}));
+    rib.position.z=z;scene.add(rib);}
+  // screen
+  tall=document.createElement('canvas');tall.width=W;tall.height=7000;tctx=tall.getContext('2d');
+  const sc=document.createElement('canvas');sc.width=W;sc.height=H;screenCtx=sc.getContext('2d');
+  screenTex=new THREE.CanvasTexture(sc);
+  const scr=new THREE.Mesh(new THREE.PlaneGeometry(9,5.06),new THREE.MeshBasicMaterial({map:screenTex}));
+  scr.position.set(0,3.1,-8);scene.add(scr);
+  const fr=new THREE.Mesh(new THREE.BoxGeometry(9.4,5.46,.2),new THREE.MeshStandardMaterial({color:0x0b1426,emissive:0x0a3a6a}));
+  fr.position.set(0,3.1,-8.12);scene.add(fr);
+  // control deck desk
+  const desk=new THREE.Mesh(new THREE.BoxGeometry(9,.9,1),new THREE.MeshStandardMaterial({color:0x14233d,metalness:.5,roughness:.5}));
+  desk.position.set(0,.45,-1.5);scene.add(desk);
+  for(let i=0;i<14;i++){const b=new THREE.Mesh(new THREE.BoxGeometry(.25,.06,.18),new THREE.MeshBasicMaterial({color:COLORS[i%6]}));
+    b.position.set(-3.9+i*.6,.93,-1.55+((i%2)*.2));scene.add(b);}
+  // stars
+  const n=1800,pos=new Float32Array(n*3);
+  for(let i=0;i<n;i++){pos.set([(Math.random()-.5)*80,Math.random()*40-5,-Math.random()*100+20],i*3);}
+  stars=new THREE.Points(new THREE.BufferGeometry().setAttribute('position',new THREE.BufferAttribute(pos,3)),new THREE.PointsMaterial({color:0xffffff,size:.18,sizeAttenuation:true}));
+  scene.add(stars);
+  addEventListener('resize',resize);resize();
+  // look controls
+  const cv=$('#c');let drag=null;
+  cv.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];cv.setPointerCapture(e.pointerId);cv.style.cursor='grabbing';});
+  cv.addEventListener('pointerup',()=>{drag=null;cv.style.cursor='grab';});
+  cv.addEventListener('pointermove',e=>{if(!drag)return;
+    yawOff=Math.max(-1.7,Math.min(1.7,yawOff+(e.clientX-drag[0])*.005));
+    pitch=Math.max(-.9,Math.min(.9,pitch-(e.clientY-drag[1])*.005));drag=[e.clientX,e.clientY];});
+  me.seat=0;seatMe();load(state.title);
+  requestAnimationFrame(loop);
+}
+function resize(){renderer.setSize(innerWidth,innerHeight,false);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();}
+function label(text){const c=document.createElement('canvas');c.width=256;c.height=64;const x=c.getContext('2d');
+  x.fillStyle='rgba(5,10,20,.7)';x.fillRect(0,0,256,64);x.fillStyle='#fff';x.font='bold 30px system-ui';x.textAlign='center';x.fillText(text,128,43);
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),transparent:true}));s.scale.set(.9,.22,1);s.position.y=1.95;return s;}
+function mkAvatar(id,p){
+  const col=COLORS[p.seat%6],g=new THREE.Group(),sp=seatPos(p.seat);
+  const m=new THREE.MeshStandardMaterial({color:col,roughness:.5});
+  const base=new THREE.Mesh(new THREE.CylinderGeometry(.3,.3,.45,16),new THREE.MeshStandardMaterial({color:0x223355}));base.position.y=.22;g.add(base);
+  const body=new THREE.Mesh(new THREE.CylinderGeometry(.26,.3,.8,14),m);body.position.y=.85;g.add(body);
+  const head=new THREE.Group();head.position.y=1.5;head.rotation.order='YXZ';
+  head.add(new THREE.Mesh(new THREE.SphereGeometry(.24,16,12),new THREE.MeshStandardMaterial({color:0xdfe8f5})));
+  const v=new THREE.Mesh(new THREE.BoxGeometry(.32,.13,.1),new THREE.MeshBasicMaterial({color:col}));v.position.set(0,.02,-.2);head.add(v);
+  g.add(head);g.add(label(p.name));g.position.set(sp.x,0,sp.z);g.userData={head,base:sp.yaw};
+  g.rotation.y=sp.yaw;head.rotation.y=0;scene.add(g);avatars[id]=g;}
+function rmAvatar(id){if(avatars[id]){scene.remove(avatars[id]);delete avatars[id];}}
+function seatMe(){const sp=seatPos(me.seat);camera.position.set(sp.x,1.5,sp.z);me.base=sp.yaw;}
+function crew(){$('#crew').textContent='Crew: '+Object.keys(players).length;}
+
+/* ---------- screen content ---------- */
+function wrap(x,text,w){const out=[];for(const para of text.split('\n')){let line='';for(const word of para.split(' ')){const t=line?line+' '+word:word;
+  if(x.measureText(t).width>w&&line){out.push(line);line=word;}else line=t;}out.push(line);}return out;}
+function buildLayout(img){
+  const x=tctx;x.clearRect(0,0,W,7000);
+  const g=x.createLinearGradient(0,0,0,7000);g.addColorStop(0,'#060d1c');g.addColorStop(1,'#0c1830');x.fillStyle=g;x.fillRect(0,0,W,7000);
+  x.fillStyle='#5ee1ff';x.font='bold 76px system-ui';x.textBaseline='top';
+  let y=60;for(const l of wrap(x,page.title,1120)){x.fillText(l,80,y);y+=90;}
+  x.fillStyle='#2a6ab8';x.fillRect(80,y,300,4);y+=40;
+  if(img){const r=Math.min(1120/img.width,420/img.height);const w=img.width*r,h=img.height*r;x.drawImage(img,(W-w)/2,y,w,h);y+=h+40;}
+  x.fillStyle='#d8e6ff';x.font='36px system-ui';
+  for(const l of wrap(x,page.text,1120)){if(y>6500)break;x.fillText(l,80,y);y+=52;}
+  y+=40;x.fillStyle='#ffd166';x.font='bold 40px system-ui';x.fillText('Nearby worlds',80,y);y+=64;
+  x.fillStyle='#9bd7ff';x.font='34px system-ui';
+  for(const l of page.links.slice(0,12)){if(y>6800)break;x.fillText('→ '+l,80,y);y+=48;}
+  pageH=y+H;
+}
+function msg(t){page={title:t,text:'',links:[]};buildLayout();}
+async function load(title){
+  const my=++token;scrollY=0;advancing=false;state.title=title;$('#now').textContent=title;
+  msg('Warping to '+title+'…');
+  try{
+    const u='https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&redirects=1&prop=extracts|pageimages|links&explaintext=1&exchars=5000&piprop=thumbnail&pithumbsize=640&pllimit=60&plnamespace=0&titles='+encodeURIComponent(title);
+    const j=await(await fetch(u)).json();const p=Object.values(j.query.pages)[0];
+    if(my!==token)return;if(p.missing!==undefined)throw 0;
+    page={title:p.title,text:p.extract||'',links:(p.links||[]).map(l=>l.title)};
+    $('#now').textContent=p.title;
+    let img=null;
+    if(p.thumbnail){img=await new Promise(r=>{const i=new Image();i.crossOrigin='anonymous';i.onload=()=>r(i);i.onerror=()=>r(null);i.src=p.thumbnail.source;});}
+    if(my!==token)return;buildLayout(img);
+  }catch(e){if(my!==token)return;page={title:'Signal lost',text:'Could not reach that region of space. Pick another destination from the deck.',links:['Moon','Mars','Black hole','Jupiter','Andromeda Galaxy']};buildLayout();}
+  const pool=[...page.links].sort(()=>Math.random()-.5).slice(0,8);
+  $('#chips').innerHTML='';pool.forEach(t=>{const b=document.createElement('button');b.textContent=t;b.onclick=()=>act({t:'nav',title:t});$('#chips').appendChild(b);});
+}
+async function resolve(q){
+  try{const j=await(await fetch('https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&list=search&srlimit=1&srsearch='+encodeURIComponent(q))).json();
+    return j.query.search[0]?j.query.search[0].title:q;}catch(e){return q;}}
+
+/* ---------- networking (serverless, Trystero) ---------- */
+let room=null,sendM=null,claimed=false,gotState=false;
+const rid=roomId||Math.random().toString(36).slice(2,8);
+if(!roomId)history.replaceState(null,'','?room='+rid);
+const leader=()=>Object.keys(players).sort()[0];
+function freeSeat(){const used=Object.entries(players).filter(([k])=>k!==me.id).map(([,p])=>p.seat);let s=0;while(used.includes(s))s++;return s;}
+function setPlayer(id,p){const old=players[id];players[id]=p;
+  if(id!==me.id&&(!avatars[id]||!old||old.seat!==p.seat)){rmAvatar(id);mkAvatar(id,p);}crew();}
+function myInfo(){return{name:me.name,seat:claimed?me.seat:-1,state:{title:state.title,speed:state.speed,y:scrollY}};}
+function claim(){me.seat=freeSeat();claimed=true;players[me.id]={name:me.name,seat:me.seat};seatMe();crew();lastPose='';}
+function act(d){onMsg(d,me.id);if(sendM)sendM(d);}
+function onMsg(d,from){
+  switch(d.t){
+    case 'nav':load(d.title);break;
+    case 'speed':state.speed=d.v;$('#spd').value=d.v;break;
+    case 'sync':if(from===me.id)break;state.speed=d.speed;$('#spd').value=d.speed;
+      if(d.title!==state.title)load(d.title);else if(Math.abs(d.y-scrollY)>40)scrollY=d.y;break;
+    case 'hello':{
+      if(!gotState&&!claimed&&d.state){gotState=true;state.speed=d.state.speed;$('#spd').value=d.state.speed;
+        if(d.state.title!==state.title)load(d.state.title);scrollY=d.state.y;}
+      if(d.seat>=0){
+        if(claimed&&d.seat===me.seat&&from<me.id){claim();sendM&&sendM({t:'hello',...myInfo()});}
+        setPlayer(from,{name:d.name,seat:d.seat});}
+      break;}
+    case 'pose':{const a=avatars[from];if(a)a.userData.head.rotation.set(d.pitch,d.yaw-a.userData.base,0);break;}
+  }
+}
+async function net(){
+  me.id='solo';
+  let T=null;
+  for(const u of ['https://esm.run/@trystero-p2p/torrent','https://esm.run/trystero']){try{T=await import(u);break;}catch(e){}}
+  if(!T){$('#now').textContent='Solo mode (multiplayer library failed to load)';claim();return;}
+  me.id=T.selfId;
+  try{room=T.joinRoom({appId:'drift-wiki-starship-v1'},rid);}catch(e){$('#now').textContent='Solo mode ('+e.message+')';claim();return;}
+  const [send,recv]=room.makeAction('m');sendM=send;recv(onMsg);
+  room.onPeerJoin(id=>send({t:'hello',...myInfo()},id));
+  room.onPeerLeave(id=>{delete players[id];rmAvatar(id);crew();});
+  setTimeout(()=>{claim();send({t:'hello',...myInfo()});},1800);
+  setInterval(()=>{if(claimed&&leader()===me.id)send({t:'sync',y:scrollY,speed:state.speed,title:state.title});},1000);
+}
+function sendPose(){
+  if(me.base===undefined||!sendM||!claimed)return;
+  const yaw=me.base+yawOff,k=yaw.toFixed(2)+pitch.toFixed(2);if(k===lastPose)return;lastPose=k;
+  sendM({t:'pose',yaw,pitch});
+}
+setInterval(sendPose,100);
+
+/* ---------- deck controls ---------- */
+$('#go').onclick=async()=>{const q=$('#q').value.trim();if(!q)return;act({t:'nav',title:await resolve(q)});$('#q').value='';};
+$('#q').onkeydown=e=>{if(e.key==='Enter')$('#go').click();e.stopPropagation();};
+$('#spd').oninput=e=>act({t:'speed',v:+e.target.value});
+$('#rnd').onclick=()=>{if(page&&page.links.length)act({t:'nav',title:page.links[Math.floor(Math.random()*page.links.length)]});};
+$('#inv').onclick=()=>{
+  const link=location.origin+location.pathname+'?room='+rid;
+  (navigator.clipboard?navigator.clipboard.writeText(link):Promise.reject()).then(()=>{$('#inv').textContent='Copied!';},()=>prompt('Invite link',link));
+  setTimeout(()=>$('#inv').textContent='Copy invite link',1500);};
+
+/* ---------- main loop ---------- */
+let last=performance.now();
+function loop(t){
+  const dt=Math.min((t-last)/1000,.1);last=t;
+  if(page){
+    scrollY+=state.speed*45*dt;
+    if(claimed&&leader()===me.id&&!advancing&&scrollY>pageH-H-60&&page.links.length&&state.speed>0){
+      advancing=true;act({t:'nav',title:page.links[Math.floor(Math.random()*page.links.length)]});}
+    scrollY=Math.min(scrollY,Math.max(0,pageH-H));
+    screenCtx.drawImage(tall,0,scrollY,W,H,0,0,W,H);screenTex.needsUpdate=true;
+  }
+  const p=stars.geometry.attributes.position;
+  for(let i=0;i<p.count;i++){let z=p.getZ(i)+(.5+state.speed*3)*dt;if(z>20)z-=120;p.setZ(i,z);}
+  p.needsUpdate=true;
+  if(me.base!==undefined){camera.rotation.set(pitch,me.base+yawOff,0);}
+  renderer.render(scene,camera);requestAnimationFrame(loop);
+}
+</script>
+</body></html>
