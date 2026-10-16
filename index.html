@@ -161,7 +161,7 @@ async function resolve(q){
     return j.query.search[0]?j.query.search[0].title:q;}catch(e){return q;}}
 
 /* ---------- networking (serverless; Trystero over 3 relay types at once) ---------- */
-const STRATS=[['torrent','https://esm.run/@trystero-p2p/torrent'],['mqtt','https://esm.run/@trystero-p2p/mqtt'],['nostr','https://esm.run/trystero']];
+const STRATS=[['torrent','https://esm.run/@trystero-p2p/torrent@0.26.0'],['mqtt','https://esm.run/@trystero-p2p/mqtt@0.26.0'],['nostr','https://esm.run/trystero@0.26.0']];
 const RTC={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},
   {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
   {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
@@ -210,11 +210,12 @@ async function addRoom(name,url){
   try{
     const T=await import(url);
     const room=T.joinRoom({appId:'drift-wiki-starship-v1',rtcConfig:RTC},rid);
-    const [send,recv]=room.makeAction('m');
-    const r={name,send,count:0};rooms.push(r);
-    recv((d,pid)=>recvRaw(d,pid,r));
-    room.onPeerJoin(pid=>{r.count++;try{send({t:'hello',...myInfo(),u:uid,n:++seq},pid);}catch(e){}});
-    room.onPeerLeave(pid=>{r.count=Math.max(0,r.count-1);peerGone(r,pid);});
+    const ac=room.makeAction('m');
+    const r={name,count:0,send:(d,pid)=>{try{const p=ac.send(d,pid?{target:pid}:undefined);if(p&&p.catch)p.catch(()=>{});}catch(e){}}};
+    rooms.push(r);
+    ac.onMessage=(d,ctx)=>recvRaw(d,ctx.peerId,r);
+    room.onPeerJoin=pid=>{r.count++;r.send({t:'hello',...myInfo(),u:uid,n:++seq},pid);};
+    room.onPeerLeave=pid=>{r.count=Math.max(0,r.count-1);peerGone(r,pid);};
   }catch(e){console.warn('relay failed',name,e);}
 }
 async function net(){
